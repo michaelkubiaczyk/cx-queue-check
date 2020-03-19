@@ -27,7 +27,8 @@ Set-Content -Path "lastDBState.txt" -value $currentStartTime
 
 $totalProcCount = 0
 $totalDBCount = $scanrequests.length
-$totalInDBOnly = 0
+$totalOldInDBOnly = 0
+$totalNewInDBOnly = 0
 $totalOnEngineOnly = 0
 $totalProcInDB = 0
 $totalDBWithProc = 0
@@ -107,16 +108,18 @@ foreach ( $engine in $engines ) {
                     if ( $e[1] -eq $toFile ) {
                         $state = "$((new-Timespan -Start $e[0] -End $currentStartTime).Minutes) min"
                         Add-Content -Path "lastDBState.txt" -Value $lastDBState[$i]
+                        $totalOldInDBOnly++
                     }
                 }
                 if ( $state -eq "new" ) {
                     Add-Content -Path "lastDBState.txt" -Value "$currentStartTime;$toFile";
+                    $totalNewInDBOnly++
                 }
 
                 Write-Host "Stuck ($state);" $scan.ID ";" $scan.taskID ";" $scan.ProjectName ";" $scan.SourceID ";" $engine.ServerName " (" $engine.hostname ")"                
                 #Write-Host "$($scan.taskID)`t$($scan.SourceID)`t$($engine.ServerName) ($($engine.hostname))`tNot running, In DB`tStage: $($scan.Stage)`tCreated: $($scan.CreatedOn)`tUpdated: $($scan.UpdatedOn)`t$($scan.ProjectName) - Stage $($scan.Stage): $($scan.StageDetails.SubString(0,[math]::min($scan.StageDetails.Length,20)))"
 
-                $totalInDBOnly++
+                
             } else {
                 $totalDBWithProc++;
             }
@@ -127,11 +130,12 @@ foreach ( $engine in $engines ) {
     #return;
 }
 
-Write-Host "There are $totalDBCount scans running in the database, and $totalProcCount processes running on engines"
+Write-Host "There are $totalDBCount running scans listed in the database, and $totalProcCount scan processes are running on engines"
 
-Write-Host "Leftover tasks: $taskList"
-if ( $taskList -ne "" ) {
-    Write-Host "Executing select taskid, sourceid, serverid, FinishTime from taskscans where taskid in ($taskList) and finishtime > dateadd( minute, -30, getdate());"
+
+if ( $taskList -ne "" ) { # triggered if there are processes running, but not in scanrequests (may be in taskscans)
+    Write-Host "Leftover tasks: $taskList"
+    #Write-Host "Executing select taskid, sourceid, serverid, FinishTime from taskscans where taskid in ($taskList) and finishtime > dateadd( minute, -30, getdate());"
     $completedTasks = Invoke-Sqlcmd -Query "select taskid, sourceid, serverid, FinishTime from taskscans where taskid in ($taskList) and finishtime > dateadd( minute, -30, getdate());" -Database "cxdb" -ServerInstance $dbServer
 
     #$completedTasks;
@@ -163,8 +167,12 @@ if ( $totalProcInDB -ne $totalDBWithProc ) {
     Write-Host "[Bad] ... but somehow $totalDBWithProc DB entries have a matching process? (numbers should match)"
 }
 
-if ( $totalInDBOnly -gt 0 ) {
-    Write-Host "[Bad] $totalInDBOnly listed in DB but not on engines."
+if ( $totalNewInDBOnly -gt 0 ) {
+    Write-Host "[Neutral] $totalNewInDBOnly new scans listed in DB but not on engines."
+}
+
+if ( $totalOldInDBOnly -gt 0 ) {
+    Write-Host "[Bad] $totalOldInDBOnly listed in DB but not on engines."
 }
 
 if ( $totalOnEngineOnly -gt 0 ) {
