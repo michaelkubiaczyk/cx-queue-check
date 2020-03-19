@@ -6,17 +6,36 @@
 
 
 $engines = Invoke-Sqlcmd -Query "select id, substring(serveruri, 8, len(serveruri) - 57) as hostname, servername from engineservers where IsBlocked = 0 order by hostname asc" -Database "cxdb" -ServerInstance $dbServer
-
 $scanrequests = Invoke-Sqlcmd -Query "select ID, SourceID, TaskID, ProjectName, ServerID, CreatedOn, UpdatedOn, Stage, StageDetails from scanrequests where serverid > 0 order by taskid asc;" -Database "cxdb" -ServerInstance $dbServer
 
+# read previous file
+$lastDBState = get-content -path "lastDBState.txt"
+$lastDBCount = $lastDBState.Length
+$lastDBTimeStamp = $lastDBState[0]
+if ( $lastDBState -is [string] ) {
+    $lastDBTimeStamp = $lastDBState
+    $lastDBCount = 0
+}
 
+$timeSinceLastDBState = new-TimeSpan -start $lastDBTimeStamp -end (Get-Date)
+Write-Host "Time since last DB state check:" $timeSinceLastDBState.minutes " min"
+
+$currentStartTime = (Get-Date)
+Set-Content -Path "lastProcessState.txt" -value $currentStartTime
+Set-Content -Path "lastDBState.txt" -value $currentStartTime
+
+
+$totalProcCount = 0
+$totalDBCount = $scanrequests.length
 $totalInDBOnly = 0
 $totalOnEngineOnly = 0
 $totalProcInDB = 0
 $totalDBWithProc = 0
 
 $taskList = ""
-$taskHash = @{};
+$procHash = @{};
+$procCount = 0;
+
 
 foreach ( $engine in $engines ) {
    # Write-Host $engine.id "-" $engine.hostname;
@@ -26,7 +45,7 @@ foreach ( $engine in $engines ) {
     $processes = gwmi -ComputerName "$rhost" -Query "select commandline from win32_process where name='CxEngineAgent.exe'"
 
     foreach ( $proc in $processes ) {
-        
+        $totalProcCount++;
         $taskID = [regex]::match( $proc.CommandLine, '.*.exe" (\d+)_.*' ).Groups[1].Value
         $sourceID = [regex]::match( $proc.CommandLine, '.*.exe" \d+_(.{36})' ).Groups[1].Value
         #Write-Host $proc.Commandline " -> $taskID, $sourceID"
@@ -50,14 +69,16 @@ foreach ( $engine in $engines ) {
                 $task['engineID'] = $engine.id;
                 $task['msg'] = "$taskID`t$sourceID`t$($engine.ServerName) ($($engine.hostname))`tRunning, Not in DB";
 
-                $taskHash.add( $taskID, $task );
+                $procCount++;
+
+                $procHash.add( $procCount, $task );
                 if ( $taskList -eq "" ) {
                     $taskList = "$([convert]::ToInt32($taskID, 10))";
                 } else {
                     $taskList = "$taskList, $([convert]::ToInt32($taskID, 10))";
                 }
             } else {
-                Write-Host "Error, received invalid taskID: $taskID"
+                Write-Host "Error, received invalid taskID $taskID for process" $proc.CommandLine
             }
         } else {
             $totalProcInDB++;
@@ -78,17 +99,24 @@ foreach ( $engine in $engines ) {
                 }
             }
             if ( $scanOnEngine -eq 0 ) {
-                #Write-Host "DB says scan#" $scan.ID " of project#" $scan.taskID " (" $scan.ProjectName ") with SourceID " $scan.SourceID " is running on " $engine.ServerName " (" $engine.hostname "), but it's not."
-                #Write-Host " - > " $scan.Stage ": " $scan.StageDetails
-
-                if ( $scan.Stage -eq 7 -and $scan.StageDetails -match "Scan completed" ) {
-                    # finishing up, so process is gone but request still in progress
-                } elseif ( $scan.Stage -le 3 ) {
-                    # starting up, may not be running yet.
-                } else {
-                    Write-Host "$($scan.taskID)`t$($scan.SourceID)`t$($engine.ServerName) ($($engine.hostname))`tNot running, In DB`tStage: $($scan.Stage)`tCreated: $($scan.CreatedOn)`tUpdated: $($scan.UpdatedOn)`t$($scan.ProjectName) - Stage $($scan.Stage): $($scan.StageDetails.SubString(0,[math]::min($scan.StageDetails.Length,20)))"
-                    $totalInDBOnly++
+                $state = "new";
+                $toFile = "$($scan.taskID),$($scan.SourceID),$($scan.ServerID)"
+           
+                for ( $i = 1; $i -lt $lastDBCount; $i++ ) {
+                    $e = $lastDBState[$i].split(";");
+                    if ( $e[1] -eq $toFile ) {
+                        $state = "$((new-Timespan -Start $e[0] -End $currentStartTime).Minutes) min"
+                        Add-Content -Path "lastDBState.txt" -Value $lastDBState[$i]
+                    }
                 }
+                if ( $state -eq "new" ) {
+                    Add-Content -Path "lastDBState.txt" -Value "$currentStartTime;$toFile";
+                }
+
+                Write-Host "Stuck ($state);" $scan.ID ";" $scan.taskID ";" $scan.ProjectName ";" $scan.SourceID ";" $engine.ServerName " (" $engine.hostname ")"                
+                #Write-Host "$($scan.taskID)`t$($scan.SourceID)`t$($engine.ServerName) ($($engine.hostname))`tNot running, In DB`tStage: $($scan.Stage)`tCreated: $($scan.CreatedOn)`tUpdated: $($scan.UpdatedOn)`t$($scan.ProjectName) - Stage $($scan.Stage): $($scan.StageDetails.SubString(0,[math]::min($scan.StageDetails.Length,20)))"
+
+                $totalInDBOnly++
             } else {
                 $totalDBWithProc++;
             }
@@ -99,16 +127,20 @@ foreach ( $engine in $engines ) {
     #return;
 }
 
-#Write-Host "Leftover tasks: $taskList"
+Write-Host "There are $totalDBCount scans running in the database, and $totalProcCount processes running on engines"
+
+Write-Host "Leftover tasks: $taskList"
 if ( $taskList -ne "" ) {
+    Write-Host "Executing select taskid, sourceid, serverid, FinishTime from taskscans where taskid in ($taskList) and finishtime > dateadd( minute, -30, getdate());"
     $completedTasks = Invoke-Sqlcmd -Query "select taskid, sourceid, serverid, FinishTime from taskscans where taskid in ($taskList) and finishtime > dateadd( minute, -30, getdate());" -Database "cxdb" -ServerInstance $dbServer
 
     #$completedTasks;
 
-    foreach ( $taskID in $taskHash.Keys ) {
+    foreach ( $taskID in $procHash.Keys ) {
         $recentlyFinished = 0
-        $task = $taskHash[$taskID];
+        $task = $procHash[$taskID];
 
+        Add-Content -Path "lastProcessState.txt" -value "$($task['id']),$($task['sourceID']), $($task['engineID'])";
 
         #Write-Host "Checking $($task['id']) - $($task['sourceID']) - $($task['engineID'])"
 
@@ -126,9 +158,15 @@ if ( $taskList -ne "" ) {
     }
 }
 
-Write-Host "Good: $totalProcInDB processes running have a db entry"
+Write-Host "[Good] $totalProcInDB processes are running and have a matching DB entry"
 if ( $totalProcInDB -ne $totalDBWithProc ) {
-    Write-Host "Bad: ... but somehow $totalDBWithProc db entries have a matching process?"
+    Write-Host "[Bad] ... but somehow $totalDBWithProc DB entries have a matching process? (numbers should match)"
 }
-Write-Host "Bad: $totalInDBOnly listed in DB but not on engines."
-Write-Host "Bad: $totalOnEngineOnly running on engines but not listed in DB."
+
+if ( $totalInDBOnly -gt 0 ) {
+    Write-Host "[Bad] $totalInDBOnly listed in DB but not on engines."
+}
+
+if ( $totalOnEngineOnly -gt 0 ) {
+    Write-Host "[Bad] $totalOnEngineOnly running on engines but not listed in DB."
+}
